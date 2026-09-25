@@ -6,27 +6,15 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from common import BusinessError, utcnow
+from decisions import DecisionService
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
-VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
-
-
-class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-        self.code = code
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class ReviewStore:
@@ -110,6 +98,9 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
+                    average_score REAL,
+                    recommendation TEXT,
+                    override_reason TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
                 );
@@ -124,6 +115,20 @@ class ReviewStore:
                 );
                 """
             )
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """为既有数据库补齐 decisions 表的新增列。"""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)")}
+        additions = {
+            "average_score": "ALTER TABLE decisions ADD COLUMN average_score REAL",
+            "recommendation": "ALTER TABLE decisions ADD COLUMN recommendation TEXT",
+            "override_reason": "ALTER TABLE decisions ADD COLUMN override_reason TEXT NOT NULL DEFAULT ''",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                conn.execute(ddl)
 
     def seed(self) -> None:
         self.init_schema()
@@ -356,36 +361,19 @@ class ReviewStore:
             self._audit(conn, paper_id, author_id, "rebuttal.submit", {"rebuttal_id": cur.lastrowid})
             return {"id": cur.lastrowid, "paper_id": paper_id, "content": content.strip()}
 
-    def decide(self, chair_id: str, paper_id: int, decision: str, note: str = "") -> dict:
-        if decision not in VALID_DECISIONS:
-            raise BusinessError("决定值不合法", 422, "invalid_decision")
-        with self.connect() as conn:
-            chair = self._user(conn, chair_id)
-            self._require(chair, "chair")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
-                if completed < 2:
-                    raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
-                cur = conn.execute(
-                    "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
-                )
-                conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
-                return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
-            except Exception:
-                conn.rollback()
-                raise
-
     def history(self, user_id: str, paper_id: int) -> list[dict]:
         self.get_paper(user_id, paper_id)  # 权限检查。
         with self.connect() as conn:
+            user = self._user(conn, user_id)
             rows = conn.execute("SELECT * FROM audit_log WHERE paper_id=? ORDER BY id", (paper_id,)).fetchall()
-            return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
+        items = [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
+        if user["role"] == "author":
+            # 作者不可见评审身份与逐条意见，只保留投稿、Rebuttal 与最终决定。
+            items = [item for item in items if item["action"] in {"paper.submit", "rebuttal.submit", "decision.record"}]
+            for item in items:
+                if item["action"] == "decision.record":
+                    item["detail"] = {"decision": item["detail"].get("decision")}
+        return items
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -393,6 +381,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def _store(self) -> ReviewStore:
         return self.server.store  # type: ignore[attr-defined]
+
+    def _decisions(self) -> DecisionService:
+        return self.server.decisions  # type: ignore[attr-defined]
 
     def _send(self, status: int, payload) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -417,8 +408,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if method == "GET" and path == "/":
-            html = (BASE_DIR / "web" / "index.html").read_bytes()
+        if method == "GET" and path in {"/", "/chair"}:
+            page = "index.html" if path == "/" else "chair.html"
+            html = (BASE_DIR / "web" / page).read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html)))
@@ -452,9 +444,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "rebuttal" and method == "POST":
                 data = self._body()
                 return self._send(201, store.submit_rebuttal(self._user_id(), paper_id, data.get("content", "")))
+            if len(parts) == 4 and parts[3] == "reviews" and method == "GET":
+                return self._send(200, self._decisions().summary(self._user_id(), paper_id))
+            if len(parts) == 4 and parts[3] == "decision" and method == "GET":
+                return self._send(200, self._decisions().decision_view(self._user_id(), paper_id))
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
-                return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+                return self._send(201, self._decisions().decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", ""), data.get("override_reason", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
@@ -494,6 +490,7 @@ class ReviewServer(ThreadingHTTPServer):
 
     def __init__(self, address, store: ReviewStore):
         self.store = store
+        self.decisions = DecisionService(store)
         super().__init__(address, ReviewHandler)
 
 

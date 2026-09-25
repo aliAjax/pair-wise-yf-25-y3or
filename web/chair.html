@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席决定 - 学术会议同行评审</title>
+<style>body{font:16px system-ui;max-width:960px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left}.err{color:#b00}.muted{color:#666}</style></head>
+<body><h1>主席决定页面</h1><p><a href="/">返回首页</a>。当前身份：<select id="user"><option>chair</option><option>alice</option><option>r1</option></select><span class="muted">（仅 chair 可查看评审与作出决定）</span></p>
+<section class="panel"><h2>论文列表</h2><button onclick="loadPapers()">刷新</button><div id="papers"></div></section>
+<section class="panel" id="detail" style="display:none">
+<h2 id="ptitle"></h2>
+<div id="reviews"></div>
+<p id="rec"></p>
+<div id="decided"></div>
+<div id="decideform">
+<h3>作出决定</h3>
+<p><select id="decision"><option value="accept">接收 accept</option><option value="reject">拒稿 reject</option><option value="minor_revision">小修 minor_revision</option><option value="major_revision">大修 major_revision</option></select>
+<input id="note" placeholder="备注（可选）" size="28">
+<input id="override" placeholder="覆盖理由（与建议不一致时必填）" size="36">
+<button onclick="submitDecision()">提交决定</button></p>
+<p class="err" id="err"></p>
+</div>
+</section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+let current=null;
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});const j=await r.json();if(!r.ok)throw j;return j}
+async function loadPapers(){try{const d=await api("/api/papers");papers.innerHTML=d.items.map(p=>`<div><a href="#" onclick="loadSummary(${p.id});return false">#${p.id} ${p.title}</a>（${p.status}）</div>`).join("")||"暂无论文"}catch(e){papers.textContent=JSON.stringify(e)}}
+async function loadSummary(id){current=id;err.textContent="";detail.style.display="block";
+try{const s=await api(`/api/papers/${id}/reviews`);
+ptitle.textContent=`论文 #${id}（${s.status}）`;
+reviews.innerHTML=s.reviews.length?`<table><tr><th>评审人</th><th>评分</th><th>意见</th><th>提交时间</th></tr>${s.reviews.map(r=>`<tr><td>${r.reviewer_id}</td><td>${r.score}</td><td>${r.review_text}</td><td>${r.submitted_at}</td></tr>`).join("")}</table>`:"<p>尚无已完成评审。</p>";
+rec.textContent=s.ready?`已完成 ${s.completed} 份评审，平均分 ${s.average}，系统建议：${s.recommendation}`:`已完成 ${s.completed}/${s.required} 份评审，评定完成后给出建议。`;
+decided.innerHTML=s.decision?`<p>已决定：<b>${s.decision.decision}</b>（均分 ${s.decision.average_score}，建议 ${s.decision.recommendation}，覆盖理由：${s.decision.override_reason||"无"}，备注：${s.decision.note||"无"}）</p>`:"";
+decideform.style.display=s.decision?"none":"block";
+}catch(e){ptitle.textContent="";reviews.innerHTML="";rec.textContent="";decided.innerHTML="";decideform.style.display="none";err.textContent=e.error?e.error.message:JSON.stringify(e)}}
+async function submitDecision(){err.textContent="";try{const d=await api(`/api/papers/${current}/decision`,{method:"POST",body:JSON.stringify({decision:decision.value,note:note.value,override_reason:override.value})});alert("决定已保存："+JSON.stringify(d,null,2));loadSummary(current)}catch(e){err.textContent=e.error?e.error.message:JSON.stringify(e)}}
+</script></body></html>
