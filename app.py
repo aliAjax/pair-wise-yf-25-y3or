@@ -12,9 +12,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from recommendation import recommend_decision
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
+# 决定记录新增的列：column -> 列定义。用于旧库平滑迁移。
+DECISION_EXTRA_COLUMNS = {
+    "average_score": "REAL",
+    "suggested_decision": "TEXT",
+    "override_reason": "TEXT NOT NULL DEFAULT ''",
+}
 
 
 class BusinessError(Exception):
@@ -110,6 +118,9 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL UNIQUE REFERENCES papers(id),
                     decision TEXT NOT NULL CHECK (decision IN ('accept','reject','minor_revision','major_revision')),
                     note TEXT NOT NULL DEFAULT '',
+                    average_score REAL,
+                    suggested_decision TEXT,
+                    override_reason TEXT NOT NULL DEFAULT '',
                     decided_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
                 );
@@ -124,6 +135,14 @@ class ReviewStore:
                 );
                 """
             )
+            # 旧库迁移：补齐决定记录的均分、建议、覆盖理由列。
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(decisions)").fetchall()
+            }
+            for name, decl in DECISION_EXTRA_COLUMNS.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
 
     def seed(self) -> None:
         self.init_schema()
@@ -189,6 +208,16 @@ class ReviewStore:
         }
         if viewer["role"] == "chair" or viewer["id"] == paper["author_id"]:
             data["author_id"] = paper["author_id"]
+            # 决定作出后作者和主席都能看到最终结论；评审人只看到状态。
+            if paper["status"] == "decided":
+                decision = conn.execute(
+                    "SELECT decision,note,created_at FROM decisions WHERE paper_id=?",
+                    (paper["id"],),
+                ).fetchone()
+                if decision:
+                    data["decision"] = decision["decision"]
+                    data["decision_note"] = decision["note"]
+                    data["decided_at"] = decision["created_at"]
         else:
             data["author_id"] = None  # 双盲：评审人看不到作者身份。
         return data
@@ -356,9 +385,17 @@ class ReviewStore:
             self._audit(conn, paper_id, author_id, "rebuttal.submit", {"rebuttal_id": cur.lastrowid})
             return {"id": cur.lastrowid, "paper_id": paper_id, "content": content.strip()}
 
-    def decide(self, chair_id: str, paper_id: int, decision: str, note: str = "") -> dict:
+    def decide(
+        self,
+        chair_id: str,
+        paper_id: int,
+        decision: str,
+        note: str = "",
+        override_reason: str = "",
+    ) -> dict:
         if decision not in VALID_DECISIONS:
             raise BusinessError("决定值不合法", 422, "invalid_decision")
+        override_reason = override_reason.strip()
         with self.connect() as conn:
             chair = self._user(conn, chair_id)
             self._require(chair, "chair")
@@ -367,25 +404,155 @@ class ReviewStore:
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if not paper or paper["status"] not in {"submitted", "under_review"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
-                if completed < 2:
+                completed = conn.execute(
+                    "SELECT score FROM assignments WHERE paper_id=? AND status='completed'",
+                    (paper_id,),
+                ).fetchall()
+                if len(completed) < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
+                # 建议计算独立于事务，见 recommendation.py。
+                recommendation = recommend_decision([row["score"] for row in completed])
+                suggested = recommendation["suggested_decision"]
+                if decision != suggested and not override_reason:
+                    raise BusinessError(
+                        f"主席决定与系统建议（{suggested}）不一致，必须填写覆盖理由",
+                        422,
+                        "override_reason_required",
+                    )
+                average = round(recommendation["average_score"], 2)
                 cur = conn.execute(
-                    "INSERT INTO decisions(paper_id,decision,note,decided_by,created_at) VALUES(?,?,?,?,?)",
-                    (paper_id, decision, note.strip(), chair_id, utcnow()),
+                    """INSERT INTO decisions
+                           (paper_id,decision,note,average_score,suggested_decision,override_reason,decided_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (paper_id, decision, note.strip(), average, suggested, override_reason, chair_id, utcnow()),
                 )
                 conn.execute("UPDATE papers SET status='decided' WHERE id=?", (paper_id,))
-                self._audit(conn, paper_id, chair_id, "decision.record", {"decision": decision, "note": note.strip()})
-                return {"id": cur.lastrowid, "paper_id": paper_id, "decision": decision, "note": note.strip()}
+                self._audit(
+                    conn,
+                    paper_id,
+                    chair_id,
+                    "decision.record",
+                    {
+                        "decision": decision,
+                        "note": note.strip(),
+                        "average_score": average,
+                        "suggested_decision": suggested,
+                        "overridden": decision != suggested,
+                    },
+                )
+                return {
+                    "id": cur.lastrowid,
+                    "paper_id": paper_id,
+                    "decision": decision,
+                    "note": note.strip(),
+                    "average_score": average,
+                    "suggested_decision": suggested,
+                    "override_reason": override_reason,
+                    "overridden": decision != suggested,
+                }
             except Exception:
                 conn.rollback()
                 raise
 
+    def get_decision_view(self, user_id: str, paper_id: int) -> dict:
+        """决定视图：主席看评审明细和建议；作者决定后只看最终结论。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                raise BusinessError("论文不存在", 404, "not_found")
+            decision_row = conn.execute(
+                "SELECT * FROM decisions WHERE paper_id=?", (paper_id,)
+            ).fetchone()
+
+            if user["role"] == "chair":
+                reviews = conn.execute(
+                    """SELECT a.id AS assignment_id,a.reviewer_id,a.score,a.review_text,a.updated_at
+                       FROM assignments a
+                       WHERE a.paper_id=? AND a.status='completed'
+                       ORDER BY a.id""",
+                    (paper_id,),
+                ).fetchall()
+                scores = [row["score"] for row in reviews]
+                recommendation = recommend_decision(scores) if scores else None
+                return {
+                    "paper_id": paper_id,
+                    "status": paper["status"],
+                    "reviews": [
+                        {
+                            "assignment_id": row["assignment_id"],
+                            "reviewer_id": row["reviewer_id"],
+                            "score": row["score"],
+                            "review_text": row["review_text"],
+                            "updated_at": row["updated_at"],
+                        }
+                        for row in reviews
+                    ],
+                    "recommendation": recommendation,
+                    "decision": self._decision_payload(decision_row) if decision_row else None,
+                }
+
+            if user["role"] == "author":
+                if paper["author_id"] != user_id:
+                    raise BusinessError("作者只能查看自己的论文", 403, "forbidden")
+                if not decision_row:
+                    raise BusinessError("决定尚未作出", 409, "decision_not_ready")
+                # 只暴露最终结论，不暴露评审身份和逐条意见。
+                return {
+                    "paper_id": paper_id,
+                    "status": paper["status"],
+                    "decision": self._decision_payload(decision_row, include_override=False),
+                }
+
+            raise BusinessError("评审人不可查看决定材料", 403, "forbidden")
+
+    @staticmethod
+    def _decision_payload(row: sqlite3.Row, include_override: bool = True) -> dict:
+        if not include_override:
+            # 作者视图：只有最终结论。
+            return {
+                "decision": row["decision"],
+                "note": row["note"],
+                "decided_at": row["created_at"],
+            }
+        return {
+            "decision": row["decision"],
+            "note": row["note"],
+            "decided_at": row["created_at"],
+            "average_score": row["average_score"],
+            "suggested_decision": row["suggested_decision"],
+            "override_reason": row["override_reason"],
+            "overridden": bool(
+                row["override_reason"] or row["decision"] != row["suggested_decision"]
+            ),
+        }
+
+    # 作者可见的审计动作；评审相关条目（含评审身份、逐条评分）不对作者开放。
+    AUTHOR_VISIBLE_ACTIONS = {"paper.submit", "rebuttal.submit", "decision.record"}
+
     def history(self, user_id: str, paper_id: int) -> list[dict]:
         self.get_paper(user_id, paper_id)  # 权限检查。
         with self.connect() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+            is_author = user["role"] == "author"
             rows = conn.execute("SELECT * FROM audit_log WHERE paper_id=? ORDER BY id", (paper_id,)).fetchall()
-            return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
+            items = []
+            for row in rows:
+                detail = json.loads(row["detail"])
+                if is_author:
+                    if row["action"] not in self.AUTHOR_VISIBLE_ACTIONS:
+                        continue
+                    if row["action"] == "decision.record":
+                        # 决定前不允许通过审计历史提前看到结论。
+                        if paper["status"] != "decided":
+                            continue
+                        detail = {"decision": detail.get("decision")}
+                items.append(
+                    dict(row)
+                    | {"detail": detail, "actor_id": row["actor_id"] if not is_author or row["actor_id"] == user_id else "system"}
+                )
+            return items
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -425,6 +592,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(html)
             return
+        if method == "GET" and path == "/chair":
+            html = (BASE_DIR / "web" / "chair.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
@@ -454,7 +629,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(201, store.submit_rebuttal(self._user_id(), paper_id, data.get("content", "")))
             if len(parts) == 4 and parts[3] == "decision" and method == "POST":
                 data = self._body()
-                return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
+                return self._send(
+                    201,
+                    store.decide(
+                        self._user_id(),
+                        paper_id,
+                        data.get("decision", ""),
+                        data.get("note", ""),
+                        data.get("override_reason", ""),
+                    ),
+                )
+            if len(parts) == 4 and parts[3] == "decision" and method == "GET":
+                return self._send(200, store.get_decision_view(self._user_id(), paper_id))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":

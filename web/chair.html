@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席决定工作台</title>
+<style>body{font:16px system-ui;max-width:960px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:70px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left}.warn{color:#a40;background:#fdecea;padding:8px;border-radius:6px}.ok{color:#065f46;background:#e6f4ea;padding:8px;border-radius:6px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}a{margin-left:8px}</style></head>
+<body>
+<h1>主席决定工作台</h1>
+<p>身份：<select id="user"><option>chair</option><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option></select>
+<a href="/">返回演示页</a></p>
+<section class="panel">
+  论文 ID：<input id="paperId" placeholder="例如 1">
+  <button onclick="loadDecisionView()">加载评审与建议</button>
+  <div id="msg"></div>
+</section>
+<section class="panel" id="worksheet" hidden>
+  <h2>评审明细（仅主席可见）</h2>
+  <table><thead><tr><th>评审人</th><th>评分</th><th>意见</th></tr></thead><tbody id="reviews"></tbody></table>
+  <h2>系统建议</h2>
+  <div id="recommendation"></div>
+  <h2>作出决定</h2>
+  <select id="decision">
+    <option value="accept">接收 accept</option>
+    <option value="minor_revision">小修 minor_revision</option>
+    <option value="major_revision">大修 major_revision</option>
+    <option value="reject">拒稿 reject</option>
+  </select>
+  <textarea id="note" placeholder="给作者的决定说明（可选）"></textarea>
+  <textarea id="overrideReason" placeholder="覆盖理由：当选择与系统建议不一致时必填"></textarea>
+  <button onclick="submitDecision()">提交决定</button>
+  <div id="existing"></div>
+</section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+const LABELS={accept:"接收",reject:"拒稿",minor_revision:"小修",major_revision:"大修"};
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return{status:r.status,body:await r.json()}}
+function show(ok,text){msg.innerHTML=`<div class="${ok?'ok':'warn'}">${text}</div>`}
+let suggestion=null;
+async function loadDecisionView(){
+  msg.textContent="";
+  const id=paperId.value.trim();
+  if(!id)return show(false,"请填写论文 ID");
+  const {status,body}=await api(`/api/papers/${id}/decision`);
+  if(status!==200){worksheet.hidden=true;return show(false,`${status} ${JSON.stringify(body.error?.message??body)}`);}
+  worksheet.hidden=false;
+  reviews.innerHTML=(body.reviews||[]).map(r=>`<tr><td>${r.reviewer_id}</td><td>${r.score}</td><td>${r.review_text??""}</td></tr>`).join("");
+  suggestion=body.recommendation?.suggested_decision??null;
+  recommendation.innerHTML=body.recommendation
+    ? `已完成评审 <b>${body.recommendation.count}</b> 份，均分 <b>${body.recommendation.average_score.toFixed(2)}</b>，较低分 <b>${body.recommendation.min_score}</b>，系统建议：<b>${LABELS[suggestion]}</b>`
+    : `<span class="warn">尚无已完成评审</span>`;
+  if(suggestion)decision.value=suggestion;
+  existing.innerHTML=body.decision
+    ? `<div class="ok">已有决定：${LABELS[body.decision.decision]||body.decision.decision}；均分 ${body.decision.average_score}；建议 ${LABELS[body.decision.suggested_decision]||body.decision.suggested_decision}；覆盖理由：${body.decision.override_reason||"（无）"}</div>`
+    : "";
+}
+async function submitDecision(){
+  const id=paperId.value.trim();
+  const payload={decision:decision.value,note:note.value};
+  if(overrideReason.value.trim())payload.override_reason=overrideReason.value;
+  const {status,body}=await api(`/api/papers/${id}/decision`,{method:"POST",body:JSON.stringify(payload)});
+  if(status===422&&body.error?.code==="override_reason_required"){
+    return show(false,`${body.error.message}（422，决定未保存）`);
+  }
+  if(status>=400)return show(false,`${status} ${JSON.stringify(body.error?.message??body)}`);
+  show(true,`决定已保存：${LABELS[body.decision]}；均分 ${body.average_score}；建议 ${LABELS[body.suggested_decision]}${body.overridden?"（已覆盖，理由已留存）":""}`);
+  loadDecisionView();
+}
+</script></body></html>
